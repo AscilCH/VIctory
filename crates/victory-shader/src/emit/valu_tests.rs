@@ -937,3 +937,115 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cmp_class_f32_matches_rdna2() {
+    // v_cmp_class_f32_e64 s6, v1, v2 (VOP3 opcode 0x088); v_cndmask_b32_e64 v0, 0, 1, s6
+    let make_cmp = |abs0: bool, neg0: bool| {
+        let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+        if abs0 {
+            w0 |= 1 << 8; // abs[0] = 1
+        }
+        if neg0 {
+            w1 |= 1 << 29; // neg[0] = 1
+        }
+        build_valu_cs(&[
+            w0,
+            w1,
+            vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+            vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+        ])
+    };
+    let cmp = make_cmp(false, false);
+    let cmp_neg = make_cmp(false, true);
+    let cmp_abs = make_cmp(true, false);
+    let cmp_abs_neg = make_cmp(true, true);
+
+    // All 10 IEEE-754 binary32 classes: bit k corresponds to class k.
+    // Quiet NaN bit is 0x0040_0000 (bit 22).
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // +sNaN (quiet bit clear, mantissa != 0)
+        (0xFFBF_FFFF, 0), // -sNaN (sign ignored for NaNs)
+        (0x7FC0_0000, 1), // +qNaN
+        (0xFFC0_0001, 1), // -qNaN
+        (0xFF80_0000, 2), // -inf
+        (0xBF80_0000, 3), // -normal (-1.0)
+        (0x8000_0001, 4), // -denormal
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7), // +denormal
+        (0x3F80_0000, 8), // +normal (+1.0)
+        (0x7F80_0000, 9), // +inf
+    ];
+    let mut cases = Vec::new();
+    for &(bits, cls) in classes {
+        // Exact class bit -> true; complement of class bit across all 10 bits -> false.
+        cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+        cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+    }
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32({:#010x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    // RDNA2 input modifiers on v_cmp_class_f32 are pure sign-bit edits:
+    // they must neither quiet sNaNs nor flush denormals, and abs runs before neg.
+    let neg_cases: &[([u32; 4], u32)] = &[
+        ([0x3F80_0000, 1 << 3, 0, 0], 1), // -(+1.0) -> -normal
+        ([0x3F80_0000, 1 << 8, 0, 0], 0),
+        ([0x0000_0000, 1 << 5, 0, 0], 1), // -(+0.0) -> -0.0
+        ([0x7F80_0001, 1 << 0, 0, 0], 1), // -(+sNaN) -> still sNaN, not quieted
+        ([0x7F80_0001, 1 << 1, 0, 0], 0),
+        ([0x0000_0001, 1 << 4, 0, 0], 1), // -(+denormal) -> -denormal, not flushed
+        ([0x0000_0001, 1 << 5, 0, 0], 0),
+    ];
+    let neg_in: Vec<[u32; 4]> = neg_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_neg, &neg_in, |backend, i, inp, got| {
+        let want = neg_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(-{:#010x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    let abs_cases: &[([u32; 4], u32)] = &[
+        ([0xBF80_0000, 1 << 8, 0, 0], 1), // |-1.0| -> +normal
+        ([0xBF80_0000, 1 << 3, 0, 0], 0),
+        ([0x8000_0000, 1 << 6, 0, 0], 1), // |-0.0| -> +0.0
+        ([0xFF80_0001, 1 << 0, 0, 0], 1), // |-sNaN| -> still sNaN, not quieted
+        ([0xFF80_0001, 1 << 1, 0, 0], 0),
+        ([0x8000_0001, 1 << 7, 0, 0], 1), // |-denormal| -> +denormal, not flushed
+        ([0x8000_0001, 1 << 6, 0, 0], 0),
+    ];
+    let abs_in: Vec<[u32; 4]> = abs_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_abs, &abs_in, |backend, i, inp, got| {
+        let want = abs_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(|{:#010x}|, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    let abs_neg_cases: &[([u32; 4], u32)] = &[
+        ([0x3F80_0000, 1 << 3, 0, 0], 1), // -|+1.0| -> -normal
+        ([0xBF80_0000, 1 << 3, 0, 0], 1), // -|-1.0| -> -normal (abs before neg)
+        ([0x7F80_0001, 1 << 0, 0, 0], 1), // -|+sNaN| -> still sNaN
+        ([0x8000_0001, 1 << 4, 0, 0], 1), // -|-denormal| -> -denormal
+    ];
+    let abs_neg_in: Vec<[u32; 4]> = abs_neg_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_abs_neg, &abs_neg_in, |backend, i, inp, got| {
+        let want = abs_neg_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(-|{:#010x}|, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}
