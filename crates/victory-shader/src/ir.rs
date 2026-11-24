@@ -929,8 +929,11 @@ fn effects(
         }
     }
     if vector {
-        r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
+        // v_readlane_b32 and v_writelane_b32 ignore EXEC on RDNA2.
+        if !matches!(name, "v_readlane_b32" | "v_writelane_b32") {
+            r.extend(mask(EXEC));
+        }
+        // Lanes disabled in EXEC (or untouched by v_writelane_b32) keep the old value.
         r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
     }
     let mut seen = Vec::with_capacity(r.len());
@@ -1223,5 +1226,37 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn readlane_and_writelane_do_not_read_exec_implicitly() {
+        let code: Vec<u8> = [
+            0xD761_0001_u32,
+            0x0001_0000, // v_writelane_b32 v1, s0, 0
+            0xD760_0002,
+            0x0001_0101, // v_readlane_b32 s2, v1, 0
+            0xD761_0001,
+            0x0001_007E, // v_writelane_b32 v1, exec_lo, 0 (explicit EXEC read)
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        for wave64 in [false, true] {
+            let p = build(&code, wave64, 8).unwrap();
+            let [write, read, spill_exec, _] = &p.blocks[0].insts[..] else {
+                panic!()
+            };
+            assert_eq!(write.read(Reg::S(EXEC)), None);
+            assert_eq!(write.read(Reg::S(EXEC + 1)), None);
+            // Untouched lanes of v1 keep their old value, so v1 is still read.
+            assert!(write.read(Reg::V(1)).is_some());
+            assert_eq!(read.read(Reg::S(EXEC)), None);
+            assert_eq!(read.read(Reg::S(EXEC + 1)), None);
+            assert_eq!(read.read(Reg::V(1)), write.write(Reg::V(1)));
+            // Explicit exec_lo operand in src0 is still recorded.
+            assert!(spill_exec.read(Reg::S(EXEC)).is_some());
+            assert_eq!(spill_exec.read(Reg::S(EXEC + 1)), None);
+        }
     }
 }

@@ -2039,6 +2039,20 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Masks a console lane selector to the wave size (`[4:0]` in wave32,
+    /// `[5:0]` in wave64), folding constants so DXIL never sees an
+    /// out-of-range lane index.
+    fn mask_lane(&mut self, lane: V) -> V {
+        let mask = self.wave() - 1;
+        match self.s.m.int_value(lane) {
+            Some(k) => self.s.m.i32((k as u32) & mask),
+            None => {
+                let m = self.s.m.i32(mask);
+                self.s.m.bin(self.cur, Bin::And, lane, m)
+            }
+        }
+    }
+
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
@@ -4206,16 +4220,20 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let lane = if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
+                    lane
                 } else {
                     self.cross_lane(false)?;
-                }
+                    self.mask_lane(lane)
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
+                // On RDNA2, v_writelane_b32 ignores EXEC (the write lands even
+                // when the target lane is inactive).
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -4225,10 +4243,11 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
+                let lane = self.mask_lane(lane);
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -7417,5 +7436,43 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn writelane_and_readlane_lower_and_validate_in_wave32_and_wave64() {
+        let code = [
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0xD761_0001,
+            0x0001_8000, // v_writelane_b32 v1, s0, 64
+            0xD761_0001,
+            0x0001_8200, // v_writelane_b32 v1, s0, -1
+            0xD760_0002,
+            0x0001_8101, // v_readlane_b32 s2, v1, 64
+            0xD760_0002,
+            0x0000_0301, // v_readlane_b32 s2, v1, s1
+            0xD761_0001,
+            0x0001_007E, // v_writelane_b32 v1, exec_lo, 0
+            0xBF81_0000, // s_endpgm
+        ];
+        let layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        for wave64 in [false, true] {
+            let lowered = lower_wave(&code, layout.clone(), vec![], wave64).unwrap();
+            assert!(lowered.wave_ops);
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                let mut copy = lowered.dxil.clone();
+                v.validate(&mut copy)
+                    .unwrap_or_else(|e| panic!("wave64={wave64}: DXIL validation failed: {e}"));
+            }
+        }
     }
 }

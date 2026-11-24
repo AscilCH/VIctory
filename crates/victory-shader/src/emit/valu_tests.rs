@@ -937,3 +937,418 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// VOP2 `op vdst, src0, vsrc1`.
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// VOPC `op src0, vsrc1`.
+const fn vopc(op: u8, src0: u16, vsrc1: u8) -> u32 {
+    0x3E << 25 | (op as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen offset:byte_off`.
+const fn buffer_store_dword_offen(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// Builds and lowers a 32-thread Wave32 compute shader with 4 root constants
+/// in `s0..s3`, thread ID in `v0` (`0..31`), and a 64-dword raw UAV at heap
+/// index 0. After `body` runs, every lane `i` stores `v1` to `uav[i]` and `v2`
+/// to `uav[32 + i]`.
+fn build_wave32_cs(body: &[u32]) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // v7 = v0 << 2 (per-lane byte offset in the raw UAV).
+    words.push(vop2(0x1A, 7, 0x82, 0));
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword_offen(1, 7, 8, 0));
+    words.extend_from_slice(&buffer_store_dword_offen(2, 7, 8, 128));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4; v0 = ThreadIdInGroup.x
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+/// Finds every SM 6.6 D3D12 adapter (hardware and WARP) whose supported wave
+/// lane range includes 32 (`WaveSize(32)`).
+fn wave32_hosts() -> Vec<(String, Host)> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D_SHADER_MODEL_6_6, D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+        D3D12_FEATURE_DATA_SHADER_MODEL, D3D12_FEATURE_SHADER_MODEL, D3D12CreateDevice,
+        ID3D12Device,
+    };
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4,
+    };
+
+    let mut out = Vec::new();
+    // SAFETY: standard DXGI/D3D12 adapter enumeration and capability queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return out;
+        };
+        let mut candidates: Vec<(String, IDXGIAdapter)> = Vec::new();
+        let warp_only = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        if !warp_only {
+            let mut idx = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(idx) {
+                idx += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                // Skip the Microsoft Basic Render Driver here; WARP is probed below.
+                if desc.Flags & 2 != 0 {
+                    continue;
+                }
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..end]);
+                candidates.push((name, adapter.into()));
+            }
+        }
+        if let Ok(warp) = factory.EnumWarpAdapter() {
+            candidates.push(("warp".into(), warp));
+        }
+        for (name, adapter) in candidates {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                continue;
+            }
+            let Some(device) = device else {
+                continue;
+            };
+            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+            };
+            if device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .is_err()
+                || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0
+            {
+                continue;
+            }
+            let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            if device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut opts).cast(),
+                    size_of_val(&opts) as u32,
+                )
+                .is_err()
+                || !opts.WaveOps.as_bool()
+                || opts.WaveLaneCountMin > 32
+                || opts.WaveLaneCountMax < 32
+            {
+                continue;
+            }
+            out.push((name, Host { device }));
+        }
+    }
+    out
+}
+
+/// Runs a 32-thread Wave32 shader on every available SM 6.6 adapter that
+/// supports `WaveSize(32)`, passing the 64 output dwords (`v1[0..32]` then
+/// `v2[0..32]`) to `check`.
+fn run_wave32_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let hosts = wave32_hosts();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 WaveSize(32) device available; execution skipped");
+        return;
+    }
+    for (label, host) in &hosts {
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, inputs, &out[0]);
+        }
+    }
+}
+
+#[test]
+fn v_writelane_b32_ignores_exec_and_masks_lane() {
+    // Narrow EXEC without a branch so lanes 0..15 are inactive and 16..31 are
+    // active, run a control v_add_nc_u32 (must obey EXEC), then v_writelane_b32
+    // and v_readlane_b32 (must both ignore EXEC and wrap src1 mod 32).
+    let mut narrowed_body = vec![
+        vop2(0x25, 1, 0xFF, 0), // v1 = 0x1000 + lane
+        0x1000,
+        s_mov_b32(12, 126),        // s12 = exec_lo
+        vopc(0xD1, 0x80 + 15, 0),  // v_cmpx_lt_u32 exec_lo, 15, v0 (lanes 16..31 active)
+        vop2(0x25, 1, sgpr(3), 1), // control: v1 += s3 (active lanes 16..31 only)
+    ];
+    narrowed_body.extend_from_slice(&vop3(0x361, 1, sgpr(0), sgpr(1), 0)); // v_writelane_b32 v1, s0, s1
+    narrowed_body.extend_from_slice(&vop3(0x360, 6, vgpr(1), sgpr(2), 0)); // v_readlane_b32 s6, v1, s2
+    narrowed_body.push(s_mov_b32(126, 12)); // restore exec_lo
+    narrowed_body.push(vop1(0x001, 2, sgpr(6))); // v2 = s6
+    let narrowed = build_wave32_cs(&narrowed_body);
+
+    let cases: &[[u32; 4]] = &[
+        // Write to inactive lane 0 and read it back.
+        [0xCAFE_BABE, 0, 0, 0x0100],
+        // Write to inactive lane 5 and read it back via wrapped selector 37 (37 & 31 == 5).
+        [0xDEAD_BEEF, 5, 37, 0x0100],
+        // Write via wrapped selector 32 (32 & 31 == 0, inactive lane) and read lane 0.
+        [0x1234_5678, 32, 0, 0x0100],
+        // Write via wrapped selector 0xFFFF_FFFF (& 31 == 31, active lane) and read via 0x1000_001F.
+        [0x89AB_CDEF, u32::MAX, 0x1000_001F, 0x0100],
+        // Write to active lane 20, read back inactive lane 3 (untouched by control add).
+        [0xAAAA_5555, 20, 3, 0x0100],
+    ];
+    run_wave32_cases(&narrowed, cases, |backend, _, inp, out| {
+        let [val, wlane, rlane, delta] = inp;
+        let w = (wlane & 31) as usize;
+        let r = (rlane & 31) as usize;
+        let mut want = [0u32; 32];
+        for (l, slot) in want.iter_mut().enumerate() {
+            *slot = 0x1000 + l as u32 + if l >= 16 { delta } else { 0 };
+        }
+        want[w] = val;
+        assert_eq!(
+            &out[..32],
+            &want[..],
+            "{backend}: narrowed v_writelane_b32(val={val:#010x}, lane={wlane:#x}) v1 mismatch"
+        );
+        for (l, &got_r) in out[32..64].iter().enumerate() {
+            assert_eq!(
+                got_r, want[r],
+                "{backend}: narrowed v_readlane_b32(lane={rlane:#x}) in lane {l} = {got_r:#010x}, want {:#010x}",
+                want[r],
+            );
+        }
+    });
+
+    // All lanes disabled (EXEC == 0): control add does nothing, while
+    // v_writelane_b32 and v_readlane_b32 still update and read the chosen lane.
+    let mut empty_body = vec![
+        vop2(0x25, 1, 0xFF, 0), // v1 = 0x2000 + lane
+        0x2000,
+        s_mov_b32(12, 126),        // s12 = exec_lo
+        vopc(0xD2, 0x80 + 64, 0),  // v_cmpx_eq_u32 exec_lo, 64, v0 (EXEC = 0)
+        vop2(0x25, 1, sgpr(3), 1), // control: no lane should execute this
+    ];
+    empty_body.extend_from_slice(&vop3(0x361, 1, sgpr(0), sgpr(1), 0)); // v_writelane_b32 v1, s0, s1
+    empty_body.extend_from_slice(&vop3(0x360, 6, vgpr(1), sgpr(2), 0)); // v_readlane_b32 s6, v1, s2
+    empty_body.push(s_mov_b32(126, 12)); // restore exec_lo
+    empty_body.push(vop1(0x001, 2, sgpr(6))); // v2 = s6
+    let empty = build_wave32_cs(&empty_body);
+
+    run_wave32_cases(
+        &empty,
+        &[
+            [0xFEED_FACE, 7, 7, 0x0500],
+            [0x0BAD_F00D, 35, 67, 0x0500], // 35 & 31 == 3, 67 & 31 == 3
+        ],
+        |backend, _, inp, out| {
+            let [val, wlane, rlane, _] = inp;
+            let w = (wlane & 31) as usize;
+            let r = (rlane & 31) as usize;
+            let mut want = [0u32; 32];
+            for (l, slot) in want.iter_mut().enumerate() {
+                *slot = 0x2000 + l as u32;
+            }
+            want[w] = val;
+            assert_eq!(
+                &out[..32],
+                &want[..],
+                "{backend}: EXEC=0 v_writelane_b32(val={val:#010x}, lane={wlane:#x}) v1 mismatch"
+            );
+            assert_eq!(
+                out[32], want[r],
+                "{backend}: EXEC=0 v_readlane_b32(lane={rlane:#x}) = {:#010x}, want {:#010x}",
+                out[32], want[r],
+            );
+        },
+    );
+
+    // Explicit EXEC as src0 of v_writelane_b32 while target lane 0 is inactive:
+    // lane 0 must receive the narrowed EXEC mask (0xFFFF_0000).
+    let mut spill_exec_body = vec![
+        vop2(0x25, 1, 0xFF, 0), // v1 = 0x3000 + lane
+        0x3000,
+        s_mov_b32(12, 126),       // s12 = exec_lo
+        vopc(0xD1, 0x80 + 15, 0), // EXEC = 0xFFFF_0000 (lanes 16..31 active)
+    ];
+    spill_exec_body.extend_from_slice(&vop3(0x361, 1, sgpr(126), 0x80, 0)); // v_writelane_b32 v1, exec_lo, 0
+    spill_exec_body.push(s_mov_b32(126, 12)); // restore exec_lo
+    spill_exec_body.extend_from_slice(&vop3(0x360, 6, vgpr(1), 0x80, 0)); // v_readlane_b32 s6, v1, 0
+    spill_exec_body.push(vop1(0x001, 2, sgpr(6)));
+    let spill_exec = build_wave32_cs(&spill_exec_body);
+
+    run_wave32_cases(&spill_exec, &[[0; 4]], |backend, _, _, out| {
+        let mut want = [0u32; 32];
+        for (l, slot) in want.iter_mut().enumerate() {
+            *slot = 0x3000 + l as u32;
+        }
+        want[0] = 0xFFFF_0000;
+        assert_eq!(
+            &out[..32],
+            &want[..],
+            "{backend}: v_writelane_b32 v1, exec_lo, 0 mismatch"
+        );
+        assert_eq!(
+            out[32], 0xFFFF_0000,
+            "{backend}: readback of spilled exec_lo"
+        );
+    });
+}
+
+#[test]
+fn v_readlane_and_writelane_wrap_constant_lane_selector() {
+    // Constant inline lane selectors >= 32 (and -1 = 0xFFFF_FFFF) must wrap
+    // modulo 32 in Wave32 and validate cleanly under dxil.dll.
+    let mut body = vec![
+        vop2(0x25, 1, 0xFF, 0), // v1 = 0x4000 + lane
+        0x4000,
+    ];
+    // v_writelane_b32 v1, s0, 32 (inline 32 = 128 + 32 = 160 -> lane 0)
+    body.extend_from_slice(&vop3(0x361, 1, sgpr(0), 128 + 32, 0));
+    // v_writelane_b32 v1, s1, -1 (inline -1 = 193 -> lane 31)
+    body.extend_from_slice(&vop3(0x361, 1, sgpr(1), 193, 0));
+    // v_readlane_b32 s6, v1, 32 (wraps to lane 0 -> s0)
+    body.extend_from_slice(&vop3(0x360, 6, vgpr(1), 128 + 32, 0));
+    // v_readlane_b32 s7, v1, -1 (wraps to lane 31 -> s1)
+    body.extend_from_slice(&vop3(0x360, 7, vgpr(1), 193, 0));
+    // v2 = s6 ^ s7 (SOP2 s_xor_b32 = 0x12)
+    body.push(sop2(0x12, 6, 6, 7));
+    body.push(vop1(0x001, 2, sgpr(6)));
+    let shader = build_wave32_cs(&body);
+
+    run_wave32_cases(
+        &shader,
+        &[[0x1357_9BDF, 0x2468_ACE0, 0, 0]],
+        |backend, _, inp, out| {
+            let mut want = [0u32; 32];
+            for (l, slot) in want.iter_mut().enumerate() {
+                *slot = 0x4000 + l as u32;
+            }
+            want[0] = inp[0];
+            want[31] = inp[1];
+            assert_eq!(
+                &out[..32],
+                &want[..],
+                "{backend}: constant wrapped v_writelane_b32 v1 mismatch"
+            );
+            assert_eq!(
+                out[32],
+                inp[0] ^ inp[1],
+                "{backend}: constant wrapped v_readlane_b32 mismatch"
+            );
+        },
+    );
+}
