@@ -66,17 +66,23 @@ impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
-        unsafe {
-            let mut device: Option<ID3D12Device> = None;
-            if warp {
+        if warp {
+            // SAFETY: DXGI returns owned factory and adapter interfaces.
+            let adapter: IDXGIAdapter = unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
+                factory.EnumWarpAdapter().map_err(err)?
+            };
+            return Self::on_adapter(&adapter);
+        }
+        Self::on_adapter(None)
+    }
+
+    fn on_adapter(adapter: impl windows::core::Param<windows::core::IUnknown>) -> Result<Self, String> {
+        // SAFETY: plain D3D12 calls with valid out pointers.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -95,6 +101,42 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// Find an SM 6.6 device that can execute a shader declaring WaveSize(32).
+    #[cfg(test)]
+    pub(super) fn for_wave32() -> Option<Self> {
+        // SAFETY: DXGI returns owned interfaces. The feature query writes to
+        // an OPTIONS1 structure of the specified size.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let wave32 = |adapter: IDXGIAdapter| {
+                let host = Self::on_adapter(&adapter).ok()?;
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+                host.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .ok()?;
+                (options.WaveOps.as_bool()
+                    && options.WaveLaneCountMin <= 32
+                    && options.WaveLaneCountMax >= 32)
+                    .then_some(host)
+            };
+            if !std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+                for index in 0.. {
+                    let Ok(adapter) = factory.EnumAdapters(index) else {
+                        break;
+                    };
+                    if let Some(host) = wave32(adapter) {
+                        return Some(host);
+                    }
+                }
+            }
+            wave32(factory.EnumWarpAdapter().ok()?)
         }
     }
 
