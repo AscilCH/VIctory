@@ -69,6 +69,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_store(body, buffer_store_dword(0, 8, 0), 1)
+}
+
+fn build_valu_cs_with_store(body: &[u32], store: [u32; 2], threads: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -79,7 +83,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&store);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -117,7 +121,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code,
     };
@@ -1025,6 +1029,74 @@ fn v_mov_b32_modifiers_are_bitwise() {
             inp[0],
         );
     });
+}
+
+#[test]
+fn v_cndmask_b32_sdwa_modifies_the_selected_subword() {
+    // v_cmp_ne_u32_e32 vcc_lo, 0, v3
+    // v_cndmask_b32_sdwa v0, -v1, v2, vcc_lo with WORD_1 / BYTE_0
+    let shader = build_valu_cs(&[0x7d8a_0680, 0x0200_04f9, 0x0015_0601]);
+    let cases = [
+        [0x0001_beef, 0xcafe_0142, 0, 0],
+        [0x0001_beef, 0xcafe_0142, 1, 0],
+    ];
+    run_cases(&shader, &cases, |backend, i, _, result| {
+        assert_eq!(result, [0x8000_0001, 0x42][i], "{backend} case {i}");
+    });
+}
+
+#[test]
+fn v_cndmask_b32_dpp_modifies_the_permuted_source() {
+    let shader = build_valu_cs_with_store(
+        &[
+            0x7e0a_0300, // v_mov_b32 v5, v0 (thread index)
+            0x4a02_0a81, // v_add_nc_u32 v1, 1, v5
+            0x340a_0a82, // v_lshlrev_b32 v5, 2, v5
+            0x7d8a_0680, // v_cmp_ne_u32_e32 vcc_lo, 0, v3
+            0x0200_04fa,
+            0xff90_b101, // cndmask DPP, -v1 / |v2|, neighbor swap
+        ],
+        [0xe070_1000, 0x8002_0005], // buffer_store_dword v0, v5, s[8:11], 0 offen
+        32,
+    );
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false)
+        .or_else(|_| Host::new(true))
+        .expect("SM 6.6 device");
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    for selector in [0, 1] {
+        let inputs = [0, 0xff80_0042, selector, 0];
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => inputs[u.dword as usize],
+                (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(32)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(out[0].len(), 32);
+        for (lane, &got) in out[0].iter().enumerate() {
+            let swapped = (lane as u32 ^ 1) + 1;
+            let want = if selector == 0 {
+                0x8000_0000 | swapped
+            } else {
+                0x7f80_0042
+            };
+            assert_eq!(got, want, "selector {selector}, lane {lane}");
+        }
+    }
 }
 
 #[test]
