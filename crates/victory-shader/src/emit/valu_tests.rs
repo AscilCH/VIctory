@@ -1060,9 +1060,10 @@ fn v_cndmask_b32_dpp_modifies_the_permuted_source() {
         32,
     );
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let host = Host::new(false)
-        .or_else(|_| Host::new(true))
-        .expect("SM 6.6 device");
+    let Some(host) = Host::for_wave32() else {
+        eprintln!("no Wave32-capable SM 6.6 device; skipping DPP dispatch");
+        return;
+    };
     let (root, pso) = host.compute_pipeline(&shader).unwrap();
     for selector in [0, 1] {
         let inputs = [0, 0xff80_0042, selector, 0];
